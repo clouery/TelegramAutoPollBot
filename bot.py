@@ -21,6 +21,8 @@ Use {date} in POLL_QUESTION to insert the next Tuesday's date, e.g.:
 import logging
 import os
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -75,6 +77,25 @@ except Exception:
     )
 
 
+# --- Health-check server (keeps Render awake) ---
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format: str, *args: tuple) -> None:
+        pass  # silence logs
+
+
+def _start_health_server() -> None:
+    port = int(os.getenv("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    logger.info("Health server listening on port %d", port)
+    server.serve_forever()
+
+
 def _next_weekday(from_date: datetime, target_day: int) -> datetime:
     """Return the next occurrence of target_day (0=Sun..6=Sat) on or after from_date."""
     days_ahead = target_day - from_date.weekday()
@@ -127,6 +148,9 @@ async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     """Set up the Application and start polling."""
+    # Start health server in background so Render keeps the bot awake
+    threading.Thread(target=_start_health_server, daemon=True).start()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Register command handlers
