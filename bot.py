@@ -1,31 +1,29 @@
 """
 Telegram Auto-Poll Bot
 
-Sends a scheduled poll to a specified Telegram chat/channel on a chosen day of the week.
+Telegram Poll Bot — send a poll on-demand via /sendpoll.
 
 Configuration via environment variables (see .env.example):
   BOT_TOKEN          — Telegram bot token from @BotFather
   CHAT_ID            — Target chat/channel ID (e.g., -1001234567890)
   POLL_QUESTION      — The poll question (max 300 chars)
   POLL_OPTIONS       — Comma-separated list of options (2-10, each max 100 chars)
-  POLL_DAY           — Day of week to send (0=Sunday, 1=Monday, ..., 6=Saturday)
-  POLL_TIME          — Time to send in HH:MM 24h format (default: 09:00)
-  POLL_TIMEZONE      — IANA timezone (default: UTC, e.g., Asia/Shanghai, America/New_York)
+  POLL_TIMEZONE      — IANA timezone (default: Asia/Singapore)
   POLL_IS_ANONYMOUS  — true/false (default: true)
   POLL_MULTIPLE      — Allow multiple answers? true/false (default: false)
-  POLL_OPEN_PERIOD   — Seconds the poll stays open (5-600, default: 300)
+  POLL_CLOSE_DAYS    — Days until poll auto-closes (1-30, default: 7)
   POLL_DATE_FORMAT   — strftime format for {date} in question (default: %Y-%m-%d)
 
-Use {date} in POLL_QUESTION to insert the current date, e.g.:
-  POLL_QUESTION=What are you doing on {date}?
+Use {date} in POLL_QUESTION to insert the next Tuesday's date, e.g.:
+  POLL_QUESTION=Training on {date}?
 """
 
 import logging
 import os
-from datetime import time, datetime, timedelta
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from telegram import Update, Poll
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # Load .env file if present
@@ -46,13 +44,11 @@ POLL_QUESTION = os.getenv("POLL_QUESTION", "What's your favorite programming lan
 POLL_OPTIONS_RAW = os.getenv("POLL_OPTIONS", "Python, TypeScript, Rust, Go")
 POLL_OPTIONS = [opt.strip() for opt in POLL_OPTIONS_RAW.split(",") if opt.strip()]
 
-POLL_DAY = int(os.getenv("POLL_DAY", "1"))  # default: Monday
-POLL_TIME_STR = os.getenv("POLL_TIME", "09:00")
-POLL_TIMEZONE_STR = os.getenv("POLL_TIMEZONE", "UTC")
+POLL_TIMEZONE_STR = os.getenv("POLL_TIMEZONE", "Asia/Singapore")
 
 POLL_IS_ANONYMOUS = os.getenv("POLL_IS_ANONYMOUS", "true").lower() == "true"
 POLL_ALLOWS_MULTIPLE = os.getenv("POLL_ALLOWS_MULTIPLE", "false").lower() == "true"
-POLL_OPEN_PERIOD = int(os.getenv("POLL_OPEN_PERIOD", "300"))
+POLL_CLOSE_DAYS = int(os.getenv("POLL_CLOSE_DAYS", "7"))
 POLL_DATE_FORMAT = os.getenv("POLL_DATE_FORMAT", "%Y-%m-%d")
 
 # --- Validation ---
@@ -64,18 +60,9 @@ if len(POLL_OPTIONS) < 2:
     raise ValueError("At least 2 poll options are required.")
 if len(POLL_OPTIONS) > 10:
     raise ValueError("At most 10 poll options are allowed.")
-if POLL_DAY < 0 or POLL_DAY > 6:
-    raise ValueError("POLL_DAY must be 0 (Sunday) through 6 (Saturday).")
-if POLL_OPEN_PERIOD < 5 or POLL_OPEN_PERIOD > 600:
-    raise ValueError("POLL_OPEN_PERIOD must be between 5 and 600 seconds.")
+if POLL_CLOSE_DAYS < 1 or POLL_CLOSE_DAYS > 30:
+    raise ValueError("POLL_CLOSE_DAYS must be between 1 and 30 days.")
 
-# Parse time
-try:
-    hour, minute = map(int, POLL_TIME_STR.split(":"))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError
-except ValueError:
-    raise ValueError("POLL_TIME must be in HH:MM 24h format (e.g., 09:00, 14:30).")
 
 # Parse timezone
 try:
@@ -86,9 +73,6 @@ except Exception:
         f"Invalid timezone '{POLL_TIMEZONE_STR}'. Use IANA names like "
         f"'UTC', 'Asia/Shanghai', 'America/New_York'."
     )
-
-# Day name mapping for logging
-DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
 
 def _next_weekday(from_date: datetime, target_day: int) -> datetime:
@@ -110,82 +94,46 @@ def _format_question() -> str:
     return POLL_QUESTION.replace("{date}", date_str)
 
 
-async def send_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the scheduled poll to the target chat."""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with bot status when /start is issued."""
+    example_question = _format_question()
+    await update.message.reply_text(
+        f"🤖 Poll Bot is running!\n\n"
+        f"Send /sendpoll to post this poll to the group:\n"
+        f"❓ <b>{example_question}</b>\n"
+        f"📋 Options: {', '.join(POLL_OPTIONS)}",
+        parse_mode="HTML",
+    )
+
+
+async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a poll to the target group (triggered by /sendpoll command)."""
     question = _format_question()
     try:
+        close_date = datetime.now(POLL_TZ) + timedelta(days=POLL_CLOSE_DAYS)
         message = await context.bot.send_poll(
             chat_id=int(CHAT_ID),
             question=question,
             options=POLL_OPTIONS,
             is_anonymous=POLL_IS_ANONYMOUS,
             allows_multiple_answers=POLL_ALLOWS_MULTIPLE,
-            open_period=POLL_OPEN_PERIOD,
+            close_date=close_date,
         )
-        logger.info(
-            "Poll sent successfully! Chat: %s, Question: %s, Options: %s",
-            CHAT_ID, question, POLL_OPTIONS,
-        )
-    except Exception as e:
-        logger.error("Failed to send poll: %s", e)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply with bot status when /start is issued."""
-    day_name = DAY_NAMES[POLL_DAY]
-    example_question = _format_question()
-    await update.message.reply_text(
-        f"🤖 Auto-Poll Bot is running!\n\n"
-        f"📅 Sends every <b>{day_name}</b> at {POLL_TIME_STR} ({POLL_TIMEZONE_STR})\n"
-        f"❓ <b>{example_question}</b>\n"
-        f"📋 Options: {', '.join(POLL_OPTIONS)}\n\n"
-        f"Use /poll to send a test poll right now.",
-        parse_mode="HTML",
-    )
-
-
-async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a test poll immediately (triggered by /poll command)."""
-    question = _format_question()
-    try:
-        message = await context.bot.send_poll(
-            chat_id=update.effective_chat.id,
-            question=question,
-            options=POLL_OPTIONS,
-            is_anonymous=POLL_IS_ANONYMOUS,
-            allows_multiple_answers=POLL_ALLOWS_MULTIPLE,
-            open_period=POLL_OPEN_PERIOD,
-        )
-        await update.message.reply_text("✅ Test poll sent!")
+        await update.message.reply_text("✅ Poll sent to the group!")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to send poll: {e}")
         logger.error("Test poll failed: %s", e)
 
 
 def main() -> None:
-    """Set up the Application, schedule the job, and start polling."""
+    """Set up the Application and start polling."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("poll", send_test_poll))
+    application.add_handler(CommandHandler("sendpoll", send_test_poll))
 
-    # Schedule the weekly poll
-    poll_time = time(hour=hour, minute=minute, tzinfo=POLL_TZ)
-    day_name = DAY_NAMES[POLL_DAY]
-
-    application.job_queue.run_daily(
-        callback=send_poll_job,
-        time=poll_time,
-        days=(POLL_DAY,),
-        chat_id=int(CHAT_ID),
-        name="weekly_poll",
-    )
-
-    logger.info(
-        "Bot started. Poll scheduled every %s at %s (%s).",
-        day_name, POLL_TIME_STR, POLL_TIMEZONE_STR,
-    )
+    logger.info("Bot started. Use /sendpoll to send a poll manually.")
 
     # Start polling (blocks until stopped)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
