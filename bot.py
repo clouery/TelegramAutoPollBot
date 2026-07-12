@@ -9,10 +9,10 @@ Configuration via environment variables (see .env.example):
   POLL_QUESTION      — The poll question (max 300 chars)
   POLL_OPTIONS       — Comma-separated list of options (2-10, each max 100 chars)
   POLL_TIMEZONE      — IANA timezone (default: Asia/Singapore)
-  POLL_IS_ANONYMOUS  — true/false (default: true)
-  POLL_MULTIPLE      — Allow multiple answers? true/false (default: false)
-  POLL_CLOSE_DAYS    — Days until poll auto-closes (1-30, default: 7)
   POLL_DATE_FORMAT   — strftime format for {date} in question (default: %Y-%m-%d)
+  POLL_DAY           — Day of week to auto-send (0=Sun..6=Sat)
+  POLL_TIME          — Time to auto-send in HH:MM 24h
+  BOT_OWNER_IDS      — Comma-separated user IDs allowed to use /sendpoll (empty = anyone)
 
 Use {date} in POLL_QUESTION or TEMPLATE_MESSAGE to insert the next Tuesday's date, e.g.:
   POLL_QUESTION=Training on {date}?
@@ -58,6 +58,10 @@ if TEMPLATE_MESSAGE:
     # Convert literal \n to actual newlines (needed for Render.com env vars)
     TEMPLATE_MESSAGE = TEMPLATE_MESSAGE.replace("\\n", "\n")
 TEMPLATE_PARSE_MODE = os.getenv("TEMPLATE_PARSE_MODE", "")
+
+# Optional: comma-separated Telegram user IDs allowed to use /sendpoll (leave empty to allow anyone)
+BOT_OWNER_IDS_RAW = os.getenv("BOT_OWNER_IDS", "")
+BOT_OWNER_IDS = {int(x.strip()) for x in BOT_OWNER_IDS_RAW.split(",") if x.strip()}
 
 # --- Validation ---
 if not BOT_TOKEN:
@@ -254,6 +258,11 @@ async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     Triggered by the /sendpoll command (DM the bot privately).
     """
+    # Owner check: if BOT_OWNER_IDS is set, only allow those users
+    if BOT_OWNER_IDS and update.effective_user.id not in BOT_OWNER_IDS:
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+
     question = _format_question()
     try:
         # Send template message before the voting message
