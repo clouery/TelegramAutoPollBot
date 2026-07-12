@@ -56,6 +56,9 @@ POLL_CLOSE_DAYS = int(os.getenv("POLL_CLOSE_DAYS", "7"))
 POLL_DATE_FORMAT = os.getenv("POLL_DATE_FORMAT", "%Y-%m-%d")
 
 TEMPLATE_MESSAGE = os.getenv("TEMPLATE_MESSAGE", "")
+if TEMPLATE_MESSAGE:
+    # Convert literal \n to actual newlines (needed for Render.com env vars)
+    TEMPLATE_MESSAGE = TEMPLATE_MESSAGE.replace("\\n", "\n")
 TEMPLATE_PARSE_MODE = os.getenv("TEMPLATE_PARSE_MODE", "")
 
 # --- Validation ---
