@@ -14,8 +14,10 @@ Configuration via environment variables (see .env.example):
   POLL_CLOSE_DAYS    — Days until poll auto-closes (1-30, default: 7)
   POLL_DATE_FORMAT   — strftime format for {date} in question (default: %Y-%m-%d)
 
-Use {date} in POLL_QUESTION to insert the next Tuesday's date, e.g.:
+Use {date} in POLL_QUESTION or TEMPLATE_MESSAGE to insert the next Tuesday's date, e.g.:
   POLL_QUESTION=Training on {date}?
+
+Set TEMPLATE_MESSAGE to send a message before the poll (with same {date}).
 """
 
 import logging
@@ -52,6 +54,9 @@ POLL_IS_ANONYMOUS = os.getenv("POLL_IS_ANONYMOUS", "true").lower() == "true"
 POLL_ALLOWS_MULTIPLE = os.getenv("POLL_ALLOWS_MULTIPLE", "false").lower() == "true"
 POLL_CLOSE_DAYS = int(os.getenv("POLL_CLOSE_DAYS", "7"))
 POLL_DATE_FORMAT = os.getenv("POLL_DATE_FORMAT", "%Y-%m-%d")
+
+TEMPLATE_MESSAGE = os.getenv("TEMPLATE_MESSAGE", "")
+TEMPLATE_PARSE_MODE = os.getenv("TEMPLATE_PARSE_MODE", "")
 
 # --- Validation ---
 if not BOT_TOKEN:
@@ -115,6 +120,16 @@ def _format_question() -> str:
     return POLL_QUESTION.replace("{date}", date_str)
 
 
+def _format_template() -> str | None:
+    """Replace {date} in TEMPLATE_MESSAGE with the same Tuesday date, or return None."""
+    if not TEMPLATE_MESSAGE:
+        return None
+    now = datetime.now(POLL_TZ)
+    target_date = _next_weekday(now, target_day=2)  # 2 = Tuesday
+    date_str = target_date.strftime(POLL_DATE_FORMAT)
+    return TEMPLATE_MESSAGE.replace("{date}", date_str)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reply with bot status when /start is issued."""
     example_question = _format_question()
@@ -128,9 +143,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a poll to the target group (triggered by /sendpoll command)."""
+    """Send a template message (if configured) then a poll to the target group.
+
+    Triggered by the /sendpoll command.
+    """
     question = _format_question()
     try:
+        # Send template message before the poll
+        template = _format_template()
+        if template:
+            kwargs = {"chat_id": int(CHAT_ID), "text": template}
+            if TEMPLATE_PARSE_MODE:
+                kwargs["parse_mode"] = TEMPLATE_PARSE_MODE
+            await context.bot.send_message(**kwargs)
+
         close_date = datetime.now(POLL_TZ) + timedelta(days=POLL_CLOSE_DAYS)
         message = await context.bot.send_poll(
             chat_id=int(CHAT_ID),
