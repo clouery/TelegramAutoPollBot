@@ -19,6 +19,7 @@ Use {date} in POLL_QUESTION or TEMPLATE_MESSAGE to insert the next Tuesday's dat
 
 Set TEMPLATE_MESSAGE to send a message before the poll (with same {date}).
 """
+from __future__ import annotations
 
 import logging
 import os
@@ -27,8 +28,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # Load .env file if present
 load_dotenv()
@@ -50,9 +51,6 @@ POLL_OPTIONS = [opt.strip() for opt in POLL_OPTIONS_RAW.split(",") if opt.strip(
 
 POLL_TIMEZONE_STR = os.getenv("POLL_TIMEZONE", "Asia/Singapore")
 
-POLL_IS_ANONYMOUS = os.getenv("POLL_IS_ANONYMOUS", "true").lower() == "true"
-POLL_ALLOWS_MULTIPLE = os.getenv("POLL_ALLOWS_MULTIPLE", "false").lower() == "true"
-POLL_CLOSE_DAYS = int(os.getenv("POLL_CLOSE_DAYS", "7"))
 POLL_DATE_FORMAT = os.getenv("POLL_DATE_FORMAT", "%Y-%m-%d")
 
 TEMPLATE_MESSAGE = os.getenv("TEMPLATE_MESSAGE", "")
@@ -70,8 +68,6 @@ if len(POLL_OPTIONS) < 2:
     raise ValueError("At least 2 poll options are required.")
 if len(POLL_OPTIONS) > 10:
     raise ValueError("At most 10 poll options are allowed.")
-if POLL_CLOSE_DAYS < 1 or POLL_CLOSE_DAYS > 30:
-    raise ValueError("POLL_CLOSE_DAYS must be between 1 and 30 days.")
 
 
 # Parse timezone
@@ -133,6 +129,111 @@ def _format_template() -> str | None:
     return TEMPLATE_MESSAGE.replace("{date}", date_str)
 
 
+# --- Inline-button voting (like CountMeInBot) ---
+# Store: {chat_id: {message_id: {user_id: {"option": str, "name": str, "username": str}}}}
+vote_store: dict[int, dict[int, dict[int, dict[str, str]]]] = {}
+
+
+def _build_vote_text(question: str, store: dict[int, dict[str, str]]) -> str:
+    """Build the voting message text with per-option name lists."""
+    # Count votes per option
+    from_collection = list(store.values())
+    option_counts: dict[str, int] = {}
+    option_voters: dict[str, list[str]] = {}
+    for opt in POLL_OPTIONS:
+        option_counts[opt] = 0
+        option_voters[opt] = []
+
+    for entry in from_collection:
+        opt = entry["option"]
+        name = entry["name"]
+        username = entry.get("username", "")
+        display = f"{name} (@{username})" if username else name
+        option_counts[opt] = option_counts.get(opt, 0) + 1
+        option_voters.setdefault(opt, []).append(display)
+
+    lines = [f"📊 {question}", ""]
+    for opt in POLL_OPTIONS:
+        count = option_counts.get(opt, 0)
+        lines.append(f"{opt} ({count}👥):")
+        if option_voters.get(opt):
+            lines.extend(f"  {v}" for v in option_voters[opt])
+        else:
+            lines.append("  —")
+        lines.append("")
+
+    lines.append(f"👥 {len(from_collection)} people responded")
+    return "\n".join(lines).strip()
+
+
+async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button presses — toggle user vote and update the message."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    # Parse callback data: "vote_{message_id}_{option_index}"
+    try:
+        _, msg_id_str, opt_idx_str = query.data.split("_")
+    except (ValueError, AttributeError):
+        return
+
+    chat_id = query.message.chat_id if query.message else 0
+    msg_id = int(msg_id_str)
+    opt_idx = int(opt_idx_str)
+
+    if opt_idx < 0 or opt_idx >= len(POLL_OPTIONS):
+        return
+
+    user = query.from_user
+    if not user:
+        return
+
+    chosen_option = POLL_OPTIONS[opt_idx]
+
+    # Update the store
+    chat_store = vote_store.setdefault(chat_id, {})
+    user_store = chat_store.setdefault(msg_id, {})
+
+    current = user_store.get(user.id)
+    if current and current["option"] == chosen_option:
+        # Same button → toggle off
+        user_store.pop(user.id, None)
+    else:
+        # Different or new vote
+        user_store[user.id] = {
+            "option": chosen_option,
+            "name": user.full_name,
+            "username": user.username or "",
+        }
+
+    # Rebuild and edit the message text (preserve buttons)
+    question = _format_question()
+    new_text = _build_vote_text(question, user_store)
+
+    # Rebuild keyboard (buttons stay the same)
+    keyboard = _build_keyboard(msg_id)
+
+    try:
+        await query.edit_message_text(
+            new_text,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("Failed to edit voting message: %s", e)
+
+
+def _build_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    """Build the inline keyboard with one button per option."""
+    buttons = [
+        [InlineKeyboardButton(opt, callback_data=f"vote_{message_id}_{i}")]
+        for i, opt in enumerate(POLL_OPTIONS)
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reply with bot status when /start is issued."""
     example_question = _format_question()
@@ -146,13 +247,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a template message (if configured) then a poll to the target group.
+    """Send a template message (if configured) then a voting message with inline buttons.
 
-    Triggered by the /sendpoll command.
+    Users tap buttons (e.g. "Coming" / "Not Coming") to cast their vote.
+    The message updates live with names of who voted.
+
+    Triggered by the /sendpoll command (DM the bot privately).
     """
     question = _format_question()
     try:
-        # Send template message before the poll
+        # Send template message before the voting message
         template = _format_template()
         if template:
             kwargs = {"chat_id": int(CHAT_ID), "text": template}
@@ -160,19 +264,30 @@ async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 kwargs["parse_mode"] = TEMPLATE_PARSE_MODE
             await context.bot.send_message(**kwargs)
 
-        close_date = datetime.now(POLL_TZ) + timedelta(days=POLL_CLOSE_DAYS)
-        message = await context.bot.send_poll(
+        # Build initial text + keyboard
+        initial_text = f"📊 {question}\n\nTap a button below to vote!"
+        # We send first to get a message_id, then build the keyboard with it
+        message = await context.bot.send_message(
             chat_id=int(CHAT_ID),
-            question=question,
-            options=POLL_OPTIONS,
-            is_anonymous=POLL_IS_ANONYMOUS,
-            allows_multiple_answers=POLL_ALLOWS_MULTIPLE,
-            close_date=close_date,
+            text=initial_text,
         )
-        await update.message.reply_text("✅ Poll sent to the group!")
+
+        # Register in vote store and attach keyboard
+        chat_store = vote_store.setdefault(int(CHAT_ID), {})
+        chat_store[message.message_id] = {}
+
+        keyboard = _build_keyboard(message.message_id)
+        await context.bot.edit_message_text(
+            initial_text,
+            chat_id=int(CHAT_ID),
+            message_id=message.message_id,
+            reply_markup=keyboard,
+        )
+
+        await update.message.reply_text("✅ Voting message sent to the group!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to send poll: {e}")
-        logger.error("Test poll failed: %s", e)
+        await update.message.reply_text(f"❌ Failed to send voting message: {e}")
+        logger.error("Voting message failed: %s", e)
 
 
 def main() -> None:
@@ -186,7 +301,10 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("sendpoll", send_test_poll))
 
-    logger.info("Bot started. Use /sendpoll to send a poll manually.")
+    # Handle inline button taps on voting messages
+    application.add_handler(CallbackQueryHandler(handle_vote, pattern=r"^vote_"))
+
+    logger.info("Bot started. Admin can use /sendpoll to post a voting message.")
 
     # Start polling (blocks until stopped)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
