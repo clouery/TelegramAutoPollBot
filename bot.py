@@ -21,6 +21,7 @@ Set TEMPLATE_MESSAGE to send a message before the poll (with same {date}).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
@@ -250,6 +251,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _notify_owner_unauthorized(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    user_name: str,
+    user_username: str,
+    chat_info: str,
+) -> None:
+    """Send a notification to the bot owner about an unauthorized access attempt."""
+    for owner_id in BOT_OWNER_IDS:
+        try:
+            username_line = f"📱 Username: @{user_username}\n" if user_username else ""
+            text = (
+                f"⚠️ Unauthorized /sendpoll attempt\n\n"
+                f"👤 ID: <code>{user_id}</code>\n"
+                f"👤 Name: {user_name}\n"
+                f"{username_line}"
+                f"💬 Chat: {chat_info}"
+            )
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text=text,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("Failed to notify owner %s: %s", owner_id, e)
+
+
 async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a template message (if configured) then a voting message with inline buttons.
 
@@ -259,8 +287,27 @@ async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Triggered by the /sendpoll command (DM the bot privately).
     """
     # Owner check: if BOT_OWNER_IDS is set, only allow those users
-    if BOT_OWNER_IDS and update.effective_user.id not in BOT_OWNER_IDS:
+    user = update.effective_user
+    if BOT_OWNER_IDS and (not user or user.id not in BOT_OWNER_IDS):
+        user_id = user.id if user else 0
+        user_name = user.full_name if user else "Unknown"
+        user_username = user.username or "" if user else ""
+        chat_type = update.effective_chat.type if update.effective_chat else "?"
+        chat_title = update.effective_chat.title or "DM" if update.effective_chat else "?"
+        chat_info = f"{chat_type} ({chat_title})"
+
+        logger.warning(
+            "Unauthorized /sendpoll by user=%s (id=%d, username=%s) in %s",
+            user_name, user_id, user_username, chat_info,
+        )
+
         await update.message.reply_text("❌ You are not authorized to use this bot.")
+
+        # Notify owner asynchronously (don't block the response)
+        if BOT_OWNER_IDS:
+            asyncio.ensure_future(
+                _notify_owner_unauthorized(context, user_id, user_name, user_username, chat_info)
+            )
         return
 
     question = _format_question()
