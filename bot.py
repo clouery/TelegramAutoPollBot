@@ -22,10 +22,12 @@ Set TEMPLATE_MESSAGE to send a message before the poll (with same {date}).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 import threading
 
 from dotenv import load_dotenv
@@ -134,15 +136,49 @@ def _format_template() -> str | None:
     return TEMPLATE_MESSAGE.replace("{date}", date_str)
 
 
+# --- Persistence ---
+VOTE_STORE_FILE = Path(os.getenv("VOTE_STORE_FILE", "vote_store.json"))
+
+
+def _load_vote_store() -> dict[int, dict[int, dict]]:
+    """Load vote_store from JSON file, converting string keys back to ints."""
+    if not VOTE_STORE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(VOTE_STORE_FILE.read_text())
+        # Convert string-keyed chat_ids and msg_ids back to int; keep "_question" as-is
+        return {
+            int(chat_id): {
+                int(msg_id): {
+                    int(k) if k.lstrip("-").isdigit() else k: v
+                    for k, v in msg.items()
+                }
+                for msg_id, msg in msgs.items()
+            }
+            for chat_id, msgs in raw.items()
+        }
+    except Exception:
+        logger.warning("Failed to load vote store from %s, starting fresh.", VOTE_STORE_FILE)
+        return {}
+
+
+def _save_vote_store() -> None:
+    """Write vote_store to JSON file."""
+    try:
+        VOTE_STORE_FILE.write_text(json.dumps(vote_store, default=str, indent=2))
+    except Exception:
+        logger.warning("Failed to save vote store to %s", VOTE_STORE_FILE)
+
+
 # --- Inline-button voting (like CountMeInBot) ---
-# Store: {chat_id: {message_id: {user_id: {"option": str, "name": str, "username": str}}}}
-vote_store: dict[int, dict[int, dict[int, dict[str, str]]]] = {}
+# {chat_id: {msg_id: {"_question": str, user_id: {"option": str, "name": str, "username": str}}}}
+vote_store: dict[int, dict[int, dict]] = _load_vote_store()
 
 
 def _build_vote_text(question: str, store: dict[int, dict[str, str]]) -> str:
     """Build the voting message text with per-option name lists."""
     # Count votes per option
-    from_collection = list(store.values())
+    from_collection = [v for v in store.values() if isinstance(v, dict)]
     option_counts: dict[str, int] = {}
     option_voters: dict[str, list[str]] = {}
     for opt in POLL_OPTIONS:
@@ -213,8 +249,10 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "username": user.username or "",
         }
 
+    _save_vote_store()
+
     # Rebuild and edit the message text (preserve buttons)
-    question = _format_question()
+    question = user_store.get("_question", _format_question())
     new_text = _build_vote_text(question, user_store)
 
     # Rebuild keyboard (buttons stay the same)
@@ -330,7 +368,8 @@ async def send_test_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Register in vote store and attach keyboard
         chat_store = vote_store.setdefault(int(CHAT_ID), {})
-        chat_store[message.message_id] = {}
+        chat_store[message.message_id] = {"_question": question}
+        _save_vote_store()
 
         keyboard = _build_keyboard(message.message_id)
         await context.bot.edit_message_text(
