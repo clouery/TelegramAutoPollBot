@@ -212,12 +212,19 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     if not query:
         return
-    await query.answer()
+
+    # Answer the callback as early as possible so the button stops showing "loading".
+    # A failed answer (already answered / query too old) must not stop vote processing.
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.debug("Callback answer failed (non-fatal): %s", e)
 
     # Parse callback data: "vote_{message_id}_{option_index}"
     try:
         _, msg_id_str, opt_idx_str = query.data.split("_")
     except (ValueError, AttributeError):
+        logger.warning("Malformed callback data: %r", getattr(query, "data", None))
         return
 
     chat_id = query.message.chat_id if query.message else 0
@@ -232,6 +239,10 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     chosen_option = POLL_OPTIONS[opt_idx]
+    logger.info(
+        "Vote received: user=%s (id=%s) -> %s | msg=%s | chat=%s",
+        user.full_name, user.id, chosen_option, msg_id, chat_id,
+    )
 
     # Update the store
     chat_store = vote_store.setdefault(chat_id, {})
@@ -259,8 +270,12 @@ async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard = _build_keyboard(msg_id)
 
     try:
-        await query.edit_message_text(
-            new_text,
+        # Edit by explicit chat_id + message_id (same as send_test_poll) so we
+        # don't depend on query.message being a fully-accessible Message object.
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=new_text,
             reply_markup=keyboard,
         )
     except Exception as e:
