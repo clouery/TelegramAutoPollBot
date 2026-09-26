@@ -26,6 +26,11 @@ Thumbs.db
 # Runtime
 *.log
 bot.log
+vote_store.json
+vote_store.json.corrupt
+
+# Testing
+.pytest_cache/
 
 # Serena
 .serena/project.local.yml
